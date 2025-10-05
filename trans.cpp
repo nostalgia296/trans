@@ -12,10 +12,11 @@
 #include <curl/curl.h>
 #include <json/json.h>
 
-// 配置结构体
+
 struct Config {
     std::string base_url;
     std::string api_key;
+    std::string model;
     int workers;
     int timeout_seconds;
 };
@@ -24,6 +25,7 @@ struct Config {
 const Config DEFAULT_CONFIG = {
     "https://api.deepseek.com/v1/chat/completions",
     "",
+    "deepseek-chat",
     20,
     60
 };
@@ -68,6 +70,7 @@ public:
         // 读取配置值，如果不存在则使用默认值
         config.base_url = root.get("base_url", DEFAULT_CONFIG.base_url).asString();
         config.api_key = root.get("api_key", DEFAULT_CONFIG.api_key).asString();
+        config.model = root.get("model", DEFAULT_CONFIG.model).asString();  // 读取模型配置
         config.workers = root.get("workers", DEFAULT_CONFIG.workers).asInt();
         config.timeout_seconds = root.get("timeout_seconds", DEFAULT_CONFIG.timeout_seconds).asInt();
         
@@ -78,6 +81,7 @@ public:
         
         std::cout << "配置加载成功:" << std::endl;
         std::cout << "  Base URL: " << config.base_url << std::endl;
+        std::cout << "  Model: " << config.model << std::endl;
         std::cout << "  Workers: " << config.workers << std::endl;
         std::cout << "  Timeout: " << config.timeout_seconds << "秒" << std::endl;
         
@@ -87,7 +91,8 @@ public:
     static void createDefaultConfig(const std::string& filename) {
         Json::Value root;
         root["base_url"] = DEFAULT_CONFIG.base_url;
-        root["api_key"] = "你的API密钥";
+        root["api_key"] = "Your key";
+        root["model"] = DEFAULT_CONFIG.model;
         root["workers"] = DEFAULT_CONFIG.workers;
         root["timeout_seconds"] = DEFAULT_CONFIG.timeout_seconds;
         
@@ -164,6 +169,7 @@ private:
     std::atomic<int> current_index;
     std::mutex results_mutex;
     std::map<int, Result> results;
+    std::string model;
     
     std::string escapeJsonString(const std::string& input) {
         std::string output;
@@ -184,13 +190,13 @@ private:
     
 public:
     WorkerManager(const std::vector<Job>& jobs_list, const Config& config, std::shared_ptr<HttpClient> http_client)
-        : jobs(jobs_list), concurrency(config.workers), client(http_client), current_index(0) {}
+        : jobs(jobs_list), concurrency(config.workers), client(http_client), current_index(0), model(config.model) {}  // 初始化模型
     
     std::string callAPI(const std::string& text) {
         std::string escaped_text = escapeJsonString(text);
         
         Json::Value payload;
-        payload["model"] = "deepseek-chat";
+        payload["model"] = model;
         
         Json::Value messages(Json::arrayValue);
         
