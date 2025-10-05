@@ -10,4 +10,5 @@
 - `base_url`: 默认deepseek
 - `api_key`: 密钥（必填）
 - `workers`: 并发工作线程数（默认：20）
+- `model`: 模型名称
 - `timeout_seconds`: 请求超时时间（默认：60秒
