@@ -13,6 +13,9 @@
 #include <json/json.h>
 
 
+std::map<std::string, std::string> readJsonFile(const std::string& filename);
+void writeJsonFile(const std::string& filename, const std::map<std::string, std::string>& data);
+
 struct Config {
     std::string base_url;
     std::string api_key;
@@ -29,6 +32,9 @@ const Config DEFAULT_CONFIG = {
     20,
     60
 };
+
+// 临时文件名
+const std::string TEMP_OUTPUT_FILE = "trans_output_temp.json";
 
 
 struct Job {
@@ -70,7 +76,7 @@ public:
         // 读取配置值，如果不存在则使用默认值
         config.base_url = root.get("base_url", DEFAULT_CONFIG.base_url).asString();
         config.api_key = root.get("api_key", DEFAULT_CONFIG.api_key).asString();
-        config.model = root.get("model", DEFAULT_CONFIG.model).asString();  // 读取模型配置
+        config.model = root.get("model", DEFAULT_CONFIG.model).asString();
         config.workers = root.get("workers", DEFAULT_CONFIG.workers).asInt();
         config.timeout_seconds = root.get("timeout_seconds", DEFAULT_CONFIG.timeout_seconds).asInt();
         
@@ -170,6 +176,8 @@ private:
     std::mutex results_mutex;
     std::map<int, Result> results;
     std::string model;
+    std::map<std::string, std::string>& completed_translations;  // 引用已完成的翻译
+    std::mutex temp_file_mutex;  // 保护临时文件写入
     
     std::string escapeJsonString(const std::string& input) {
         std::string output;
@@ -188,9 +196,14 @@ private:
         return output;
     }
     
+    // 声明保存单个翻译结果到临时文件的方法
+    void saveToTempFile(const std::string& key, const std::string& text);
+    
 public:
-    WorkerManager(const std::vector<Job>& jobs_list, const Config& config, std::shared_ptr<HttpClient> http_client)
-        : jobs(jobs_list), concurrency(config.workers), client(http_client), current_index(0), model(config.model) {}  // 初始化模型
+    WorkerManager(const std::vector<Job>& jobs_list, const Config& config, std::shared_ptr<HttpClient> http_client,
+                  std::map<std::string, std::string>& completed)
+        : jobs(jobs_list), concurrency(config.workers), client(http_client), current_index(0), 
+          model(config.model), completed_translations(completed) {}
     
     std::string callAPI(const std::string& text) {
         std::string escaped_text = escapeJsonString(text);
@@ -252,6 +265,9 @@ public:
             
             try {
                 result.text = callAPI(job.text);
+                // 立即保存到临时文件
+                saveToTempFile(job.key, result.text);
+                std::cout << "完成翻译: " << job.key << std::endl;
             } catch (const std::exception& e) {
                 result.error = e.what();
             }
@@ -335,6 +351,29 @@ void writeJsonFile(const std::string& filename, const std::map<std::string, std:
     file.close();
 }
 
+
+void WorkerManager::saveToTempFile(const std::string& key, const std::string& text) {
+    std::lock_guard<std::mutex> lock(temp_file_mutex);
+    
+    // 读取现有的临时文件内容
+    std::map<std::string, std::string> existing_data;
+    std::ifstream temp_file(TEMP_OUTPUT_FILE);
+    if (temp_file.is_open()) {
+        try {
+            temp_file.close();
+            existing_data = readJsonFile(TEMP_OUTPUT_FILE);
+        } catch (...) {
+            // 如果读取失败，使用空map
+        }
+    }
+    
+    // 添加新的翻译结果
+    existing_data[key] = text;
+    
+    // 写回临时文件
+    writeJsonFile(TEMP_OUTPUT_FILE, existing_data);
+}
+
 int main(int argc, char* argv[]) {
     // 检查是否要创建默认配置文件
     if (argc == 2 && std::string(argv[1]) == "--create-config") {
@@ -351,21 +390,52 @@ int main(int argc, char* argv[]) {
         // 读取原始数据
         auto orig = readJsonFile("trans.json");
         
-        // 创建任务列表
+        // 读取已完成
+        std::map<std::string, std::string> completed_translations;
+        try {
+            std::ifstream temp_file(TEMP_OUTPUT_FILE);
+            if (temp_file.is_open()) {
+                temp_file.close();
+                completed_translations = readJsonFile(TEMP_OUTPUT_FILE);
+                std::cout << "发现已完成的翻译 " << completed_translations.size() << " 条，将跳过这些条目" << std::endl;
+            }
+        } catch (const std::exception& e) {
+            std::cout << "读取临时文件失败，将重新开始翻译: " << e.what() << std::endl;
+        }
+        
+        // 创建任务列表，跳过已完成的
         std::vector<Job> jobs;
         int index = 0;
+        int skipped = 0;
         for (const auto& pair : orig) {
-            jobs.push_back({pair.first, pair.second, index++});
+            if (completed_translations.find(pair.first) == completed_translations.end()) {
+                jobs.push_back({pair.first, pair.second, index++});
+            } else {
+                skipped++;
+            }
         }
+        
+        if (jobs.empty()) {
+            std::cout << "所有翻译都已完成，无需处理" << std::endl;
+            // 如果临时文件存在，将其复制为最终输出
+            if (!completed_translations.empty()) {
+                writeJsonFile("trans_output.json", completed_translations);
+                std::cout << "结果已写入 trans_output.json" << std::endl;
+            }
+            curl_global_cleanup();
+            return 0;
+        }
+        
+        std::cout << "需要翻译 " << jobs.size() << " 条，跳过 " << skipped << " 条已完成" << std::endl;
         
         // 创建HTTP客户端
         auto client = std::make_shared<HttpClient>(config);
-        WorkerManager manager(jobs, config, client);
+        WorkerManager manager(jobs, config, client, completed_translations);
         auto results = manager.run();
         
-        // 处理结果
-        std::map<std::string, std::string> output;
-        int success_count = 0;
+        // 合并结果
+        std::map<std::string, std::string> output = completed_translations;
+        int success_count = completed_translations.size();
         int fail_count = 0;
         
         for (const auto& result : results) {
@@ -378,8 +448,11 @@ int main(int argc, char* argv[]) {
             }
         }
         
-        // 写入输出文件
+        // 写入最终输出文件
         writeJsonFile("trans_output.json", output);
+        
+        // 删除临时文件
+        std::remove(TEMP_OUTPUT_FILE.c_str());
         
         std::cout << "全部翻译完成，结果已写入 trans_output.json" << std::endl;
         std::cout << "成功: " << success_count << ", 失败: " << fail_count << std::endl;
