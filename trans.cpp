@@ -11,6 +11,8 @@
 #include <sstream>
 #include <curl/curl.h>
 #include <json/json.h>
+#include <random>
+#include <chrono>
 
 
 std::map<std::string, std::string> readJsonFile(const std::string& filename);
@@ -22,18 +24,22 @@ struct Config {
     std::string model;
     int workers;
     int timeout_seconds;
+    int max_retries;
+    int base_delay_ms;
+    int max_delay_ms;
 };
 
-// 默认配置值
 const Config DEFAULT_CONFIG = {
     "https://api.deepseek.com/v1/chat/completions",
     "",
     "deepseek-chat",
     20,
-    60
+    60,
+    3,
+    1000,
+    10000
 };
 
-// 临时文件名
 const std::string TEMP_OUTPUT_FILE = "trans_output_temp.json";
 
 
@@ -73,14 +79,15 @@ public:
         
         Config config;
         
-        // 读取配置值，如果不存在则使用默认值
         config.base_url = root.get("base_url", DEFAULT_CONFIG.base_url).asString();
         config.api_key = root.get("api_key", DEFAULT_CONFIG.api_key).asString();
         config.model = root.get("model", DEFAULT_CONFIG.model).asString();
         config.workers = root.get("workers", DEFAULT_CONFIG.workers).asInt();
         config.timeout_seconds = root.get("timeout_seconds", DEFAULT_CONFIG.timeout_seconds).asInt();
+        config.max_retries = root.get("max_retries", DEFAULT_CONFIG.max_retries).asInt();
+        config.base_delay_ms = root.get("base_delay_ms", DEFAULT_CONFIG.base_delay_ms).asInt();
+        config.max_delay_ms = root.get("max_delay_ms", DEFAULT_CONFIG.max_delay_ms).asInt();
         
-        // 验证必要的配置
         if (config.api_key.empty() || config.api_key == DEFAULT_CONFIG.api_key) {
             std::cerr << "警告: API密钥未配置或使用默认值，请检查config.json" << std::endl;
         }
@@ -90,6 +97,9 @@ public:
         std::cout << "  Model: " << config.model << std::endl;
         std::cout << "  Workers: " << config.workers << std::endl;
         std::cout << "  Timeout: " << config.timeout_seconds << "秒" << std::endl;
+        std::cout << "  Max Retries: " << config.max_retries << std::endl;
+        std::cout << "  Base Delay: " << config.base_delay_ms << "ms" << std::endl;
+        std::cout << "  Max Delay: " << config.max_delay_ms << "ms" << std::endl;
         
         return config;
     }
@@ -101,6 +111,9 @@ public:
         root["model"] = DEFAULT_CONFIG.model;
         root["workers"] = DEFAULT_CONFIG.workers;
         root["timeout_seconds"] = DEFAULT_CONFIG.timeout_seconds;
+        root["max_retries"] = DEFAULT_CONFIG.max_retries;
+        root["base_delay_ms"] = DEFAULT_CONFIG.base_delay_ms;
+        root["max_delay_ms"] = DEFAULT_CONFIG.max_delay_ms;
         
         Json::StreamWriterBuilder writer;
         writer["indentation"] = "  ";
@@ -176,8 +189,13 @@ private:
     std::mutex results_mutex;
     std::map<int, Result> results;
     std::string model;
-    std::map<std::string, std::string>& completed_translations;  // 引用已完成的翻译
-    std::mutex temp_file_mutex;  // 保护临时文件写入
+    std::map<std::string, std::string>& completed_translations;
+    std::mutex temp_file_mutex;
+    
+    int max_retries;
+    int base_delay_ms;
+    int max_delay_ms;
+    std::mt19937 rng;
     
     std::string escapeJsonString(const std::string& input) {
         std::string output;
@@ -196,14 +214,27 @@ private:
         return output;
     }
     
-    // 声明保存单个翻译结果到临时文件的方法
     void saveToTempFile(const std::string& key, const std::string& text);
+    
+    int calculateDelayWithJitter(int attempt) {
+        int delay = base_delay_ms * (1 << (attempt - 1));
+        if (delay > max_delay_ms) {
+            delay = max_delay_ms;
+        }
+        
+        std::uniform_int_distribution<int> dist(0, delay / 2);
+        int jitter = dist(rng);
+        
+        return delay + jitter;
+    }
     
 public:
     WorkerManager(const std::vector<Job>& jobs_list, const Config& config, std::shared_ptr<HttpClient> http_client,
                   std::map<std::string, std::string>& completed)
         : jobs(jobs_list), concurrency(config.workers), client(http_client), current_index(0), 
-          model(config.model), completed_translations(completed) {}
+          model(config.model), completed_translations(completed),
+          max_retries(config.max_retries), base_delay_ms(config.base_delay_ms), 
+          max_delay_ms(config.max_delay_ms), rng(std::random_device{}()) {}
     
     std::string callAPI(const std::string& text) {
         std::string escaped_text = escapeJsonString(text);
@@ -228,27 +259,45 @@ public:
         Json::StreamWriterBuilder writer;
         std::string payload_str = Json::writeString(writer, payload);
         
-        std::string response_str = client->post("", payload_str);
-        
-        Json::Value response_json;
-        Json::CharReaderBuilder reader;
-        std::string errors;
-        std::istringstream response_stream(response_str);
-        
-        if (!Json::parseFromStream(reader, response_stream, &response_json, &errors)) {
-            throw std::runtime_error("Failed to parse JSON response: " + errors);
+        for (int attempt = 1; attempt <= max_retries; ++attempt) {
+            try {
+                std::string response_str = client->post("", payload_str);
+                
+                Json::Value response_json;
+                Json::CharReaderBuilder reader;
+                std::string errors;
+                std::istringstream response_stream(response_str);
+                
+                if (!Json::parseFromStream(reader, response_stream, &response_json, &errors)) {
+                    throw std::runtime_error("Failed to parse JSON response: " + errors);
+                }
+                
+                if (response_json.isMember("choices") && 
+                    response_json["choices"].isArray() && 
+                    !response_json["choices"].empty() &&
+                    response_json["choices"][0].isMember("message") &&
+                    response_json["choices"][0]["message"].isMember("content")) {
+                    
+                    return response_json["choices"][0]["message"]["content"].asString();
+                }
+                
+                throw std::runtime_error("Invalid response format");
+                
+            } catch (const std::exception& e) {
+                if (attempt == max_retries) {
+                    throw std::runtime_error("Failed after " + std::to_string(max_retries) + 
+                                           " attempts. Last error: " + e.what());
+                }
+                
+                int delay_ms = calculateDelayWithJitter(attempt);
+                std::cout << "Attempt " << attempt << " failed: " << e.what() 
+                          << ", retrying in " << delay_ms << "ms" << std::endl;
+                
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+            }
         }
         
-        if (response_json.isMember("choices") && 
-            response_json["choices"].isArray() && 
-            !response_json["choices"].empty() &&
-            response_json["choices"][0].isMember("message") &&
-            response_json["choices"][0]["message"].isMember("content")) {
-            
-            return response_json["choices"][0]["message"]["content"].asString();
-        }
-        
-        throw std::runtime_error("Invalid response format");
+        throw std::runtime_error("Unexpected error in retry logic");
     }
     
     void worker() {
@@ -265,7 +314,6 @@ public:
             
             try {
                 result.text = callAPI(job.text);
-                // 立即保存到临时文件
                 saveToTempFile(job.key, result.text);
                 std::cout << "完成翻译: " << job.key << std::endl;
             } catch (const std::exception& e) {
@@ -299,7 +347,6 @@ public:
     }
 };
 
-// 读取JSON文件
 std::map<std::string, std::string> readJsonFile(const std::string& filename) {
     std::ifstream file(filename);
     if (!file.is_open()) {
@@ -324,7 +371,6 @@ std::map<std::string, std::string> readJsonFile(const std::string& filename) {
     return result;
 }
 
-//避免Unicode转义
 void writeJsonFile(const std::string& filename, const std::map<std::string, std::string>& data) {
     std::ofstream file(filename);
     if (!file.is_open()) {
@@ -340,10 +386,7 @@ void writeJsonFile(const std::string& filename, const std::map<std::string, std:
         }
         first = false;
         
-        // 键名（保持原样）
         file << "  \"" << pair.first << "\" : ";
-        
-        // 值 - 直接输出，不进行Unicode转义
         file << "\"" << pair.second << "\"";
     }
     
@@ -351,11 +394,9 @@ void writeJsonFile(const std::string& filename, const std::map<std::string, std:
     file.close();
 }
 
-
 void WorkerManager::saveToTempFile(const std::string& key, const std::string& text) {
     std::lock_guard<std::mutex> lock(temp_file_mutex);
     
-    // 读取现有的临时文件内容
     std::map<std::string, std::string> existing_data;
     std::ifstream temp_file(TEMP_OUTPUT_FILE);
     if (temp_file.is_open()) {
@@ -363,19 +404,14 @@ void WorkerManager::saveToTempFile(const std::string& key, const std::string& te
             temp_file.close();
             existing_data = readJsonFile(TEMP_OUTPUT_FILE);
         } catch (...) {
-            // 如果读取失败，使用空map
         }
     }
     
-    // 添加新的翻译结果
     existing_data[key] = text;
-    
-    // 写回临时文件
     writeJsonFile(TEMP_OUTPUT_FILE, existing_data);
 }
 
 int main(int argc, char* argv[]) {
-    // 检查是否要创建默认配置文件
     if (argc == 2 && std::string(argv[1]) == "--create-config") {
         ConfigManager::createDefaultConfig("config.json");
         return 0;
@@ -384,13 +420,10 @@ int main(int argc, char* argv[]) {
     curl_global_init(CURL_GLOBAL_DEFAULT);
     
     try {
-        // 加载配置
         Config config = ConfigManager::loadConfig("config.json");
         
-        // 读取原始数据
         auto orig = readJsonFile("trans.json");
         
-        // 读取已完成
         std::map<std::string, std::string> completed_translations;
         try {
             std::ifstream temp_file(TEMP_OUTPUT_FILE);
@@ -403,7 +436,6 @@ int main(int argc, char* argv[]) {
             std::cout << "读取临时文件失败，将重新开始翻译: " << e.what() << std::endl;
         }
         
-        // 创建任务列表，跳过已完成的
         std::vector<Job> jobs;
         int index = 0;
         int skipped = 0;
@@ -417,7 +449,6 @@ int main(int argc, char* argv[]) {
         
         if (jobs.empty()) {
             std::cout << "所有翻译都已完成，无需处理" << std::endl;
-            // 如果临时文件存在，将其复制为最终输出
             if (!completed_translations.empty()) {
                 writeJsonFile("trans_output.json", completed_translations);
                 std::cout << "结果已写入 trans_output.json" << std::endl;
@@ -428,12 +459,10 @@ int main(int argc, char* argv[]) {
         
         std::cout << "需要翻译 " << jobs.size() << " 条，跳过 " << skipped << " 条已完成" << std::endl;
         
-        // 创建HTTP客户端
         auto client = std::make_shared<HttpClient>(config);
         WorkerManager manager(jobs, config, client, completed_translations);
         auto results = manager.run();
         
-        // 合并结果
         std::map<std::string, std::string> output = completed_translations;
         int success_count = completed_translations.size();
         int fail_count = 0;
@@ -448,10 +477,7 @@ int main(int argc, char* argv[]) {
             }
         }
         
-        // 写入最终输出文件
         writeJsonFile("trans_output.json", output);
-        
-        // 删除临时文件
         std::remove(TEMP_OUTPUT_FILE.c_str());
         
         std::cout << "全部翻译完成，结果已写入 trans_output.json" << std::endl;
