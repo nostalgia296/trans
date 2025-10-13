@@ -11,10 +11,43 @@
 #include <random>
 #include <chrono>
 #include <iomanip>
+#include <string>
 
 #include <curl/curl.h>
 #include <json/json.h>
 
+
+
+std::string utf8_substr(const std::string& str, int num_chars) {
+    if (num_chars <= 0) {
+        return "";
+    }
+
+    int byte_index = 0;
+    int char_count = 0;
+    
+    while (byte_index < str.length() && char_count < num_chars) {
+        unsigned char c = str[byte_index];
+        if (c < 0x80) {
+            byte_index += 1;
+        } else if ((c & 0xE0) == 0xC0) {
+            byte_index += 2;
+        } else if ((c & 0xF0) == 0xE0) {
+            byte_index += 3;
+        } else if ((c & 0xF8) == 0xF0) {
+            byte_index += 4;
+        } else {
+            byte_index += 1;
+        }
+        char_count++;
+    }
+
+    if (byte_index > str.length()) {
+        return str;
+    }
+
+    return str.substr(0, byte_index);
+}
 
 std::map<std::string, std::string> readJsonFile(const std::string& filename);
 void writeJsonFile(const std::string& filename, const std::map<std::string, std::string>& data);
@@ -281,8 +314,11 @@ public:
                 }
                 
                 int delay_ms = calculateDelayWithJitter(attempt);
-                std::cerr << "任务 " << text.substr(0, 20) << "... 尝试 " << attempt << " 失败: " << e.what() 
-                          << ", " << delay_ms << "ms 后重试" << std::endl;
+                
+              std::string text_preview = utf8_substr(text, 10); 
+    
+              std::cerr << "任务 \"" << text_preview << "...\" 尝试 " << attempt << " 失败: " << e.what() 
+              << ", " << delay_ms << "ms 后重试" << std::endl;
                 
                 std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
             }
