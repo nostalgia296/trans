@@ -1,5 +1,3 @@
-# trans
-### 还需要一些完善....
 **创建默认配置文件**
 
 ```bash
@@ -11,4 +9,7 @@
 - `api_key`: 密钥（必填）
 - `workers`: 并发工作线程数（默认：20）
 - `model`: 模型名称
-- `timeout_seconds`: 请求超时时间（默认：60秒
+- `timeout_seconds`: 请求超时时间（默认：60秒）
+- `max_retries`:失败重试次数(默认3)
+- `max_delay_ms`:最大延迟（默认10000ms)
+- `base_delay_ms`:初始延迟(默认1000ms)
