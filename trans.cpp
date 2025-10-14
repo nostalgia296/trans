@@ -12,11 +12,11 @@
 #include <chrono>
 #include <iomanip>
 #include <string>
+#include <condition_variable>
+#include <csignal>
 
 #include <curl/curl.h>
 #include <json/json.h>
-
-
 
 std::string utf8_substr(const std::string& str, int num_chars) {
     if (num_chars <= 0) {
@@ -52,7 +52,6 @@ std::string utf8_substr(const std::string& str, int num_chars) {
 std::map<std::string, std::string> readJsonFile(const std::string& filename);
 void writeJsonFile(const std::string& filename, const std::map<std::string, std::string>& data);
 
-
 struct Config {
     std::string base_url;
     std::string api_key;
@@ -75,7 +74,6 @@ const Config DEFAULT_CONFIG = {
     10000
 };
 
-
 struct Job {
     std::string key;
     std::string text;
@@ -89,7 +87,6 @@ struct Result {
     std::string error;
 };
 
-
 class CurlGlobalInitializer {
 public:
     CurlGlobalInitializer() {
@@ -101,7 +98,6 @@ public:
         curl_global_cleanup();
     }
 };
-
 
 class ConfigManager {
 public:
@@ -170,7 +166,6 @@ public:
     }
 };
 
-
 size_t WriteCallback(void* contents, size_t size, size_t nmemb, std::string* response) {
     size_t totalSize = size * nmemb;
     response->append(static_cast<char*>(contents), totalSize);
@@ -218,6 +213,22 @@ public:
     }
 };
 
+static std::atomic<bool> g_shutdown_requested(false);
+static std::atomic<bool> g_force_exit(false);
+
+void signal_handler(int signal) {
+    static int signal_count = 0;
+    signal_count++;
+    
+    if (signal_count == 1) {
+        std::cout << "\n收到中断信号，正在优雅退出..." << std::endl;
+        g_shutdown_requested = true;
+    } else if (signal_count >= 2) {
+        std::cout << "\n强制退出..." << std::endl;
+        g_force_exit = true;
+        std::quick_exit(1);
+    }
+}
 
 class WorkerManager {
 private:
@@ -226,27 +237,50 @@ private:
     std::shared_ptr<HttpClient> client;
     std::string model;
     
-
     std::atomic<int> job_index;
     std::atomic<int> completed_count;
     std::mutex results_mutex;
     std::map<int, Result> results;
-    std::mutex temp_file_mutex;
+    
+    struct Buffer {
+        std::map<std::string, std::string> data;
+        std::mutex mutex;
+        bool active;
+    };
+    
+    Buffer buffer1;
+    Buffer buffer2;
+    Buffer* write_buffer;
+    Buffer* flush_buffer;
+    std::thread flush_thread;
+    std::atomic<bool> running;
+    std::condition_variable flush_cv;
+    std::mutex flush_mutex;
     const std::string& temp_output_file;
-
-
+    std::mutex swap_mutex;
+    
     int max_retries;
     int base_delay_ms;
     int max_delay_ms;
     std::mt19937 rng;
-
+    
+    void flushWorker();
     void saveToTempFile(const std::string& key, const std::string& text);
+    void swapBuffers();
+    void flushBufferData(Buffer* buffer);
     
     int calculateDelayWithJitter(int attempt) {
         int delay = base_delay_ms * (1 << (attempt - 1));
         delay = std::min(delay, max_delay_ms);
         std::uniform_int_distribution<int> dist(0, delay / 2);
         return delay + dist(rng);
+    }
+    
+    bool checkShutdown() {
+        if (g_force_exit) {
+            std::quick_exit(1);
+        }
+        return g_shutdown_requested;
     }
     
 public:
@@ -261,16 +295,61 @@ public:
           max_retries(config.max_retries), 
           base_delay_ms(config.base_delay_ms), 
           max_delay_ms(config.max_delay_ms), 
-          rng(std::random_device{}()) {}
+          rng(std::random_device{}()),
+          running(true) {
+        
+        buffer1.active = true;
+        buffer2.active = false;
+        write_buffer = &buffer1;
+        flush_buffer = &buffer2;
+        
+        flush_thread = std::thread(&WorkerManager::flushWorker, this);
+    }
+    
+    ~WorkerManager() {
+        running = false;
+        flush_cv.notify_all();
+        
+        if (flush_thread.joinable()) {
+            auto start = std::chrono::steady_clock::now();
+            if (flush_thread.joinable()) {
+                flush_thread.join();
+            }
+            auto end = std::chrono::steady_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::seconds>(end - start);
+            if (duration.count() > 5) {
+                std::cerr << "警告: Flush线程等待时间过长" << std::endl;
+            }
+        }
+        
+        if (!write_buffer->data.empty()) {
+            try {
+                swapBuffers();
+                flushBufferData(flush_buffer);
+            } catch (...) {
+                std::cerr << "警告: 最终数据刷新失败" << std::endl;
+            }
+        }
+    }
+    
+    void requestShutdown() {
+        g_shutdown_requested = true;
+        running = false;
+        flush_cv.notify_all();
+    }
     
     std::string callAPI(const std::string& text) {
+        if (checkShutdown()) {
+            throw std::runtime_error("Shutdown requested");
+        }
+        
         Json::Value payload;
         payload["model"] = model;
         
         Json::Value messages(Json::arrayValue);
         Json::Value system_msg;
         system_msg["role"] = "system";
-        system_msg["content"] = "你是中日翻译大师，能够完美的把其中一种语言翻译成另一种";
+        system_msg["content"] = "你是中日翻译大师，现在你要将日文翻译成中文，现在你在翻译一个rpg游戏的内容，如果遇到非日文的文本，不用翻译，直接输出原文，请保持原格式，只是翻译文本";
         messages.append(system_msg);
         
         Json::Value user_msg;
@@ -285,6 +364,10 @@ public:
         std::string payload_str = Json::writeString(writer, payload);
         
         for (int attempt = 1; attempt <= max_retries; ++attempt) {
+            if (checkShutdown()) {
+                throw std::runtime_error("Shutdown requested");
+            }
+            
             try {
                 std::string response_str = client->post(payload_str);
                 
@@ -315,47 +398,73 @@ public:
                 
                 int delay_ms = calculateDelayWithJitter(attempt);
                 
-              std::string text_preview = utf8_substr(text, 10); 
-    
-              std::cerr << "任务 \"" << text_preview << "...\" 尝试 " << attempt << " 失败: " << e.what() 
-              << ", " << delay_ms << "ms 后重试" << std::endl;
+                std::string text_preview = utf8_substr(text, 10); 
                 
-                std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+                std::cerr << "任务 \"" << text_preview << "...\" 尝试 " << attempt << " 失败: " << e.what() 
+                << ", " << delay_ms << "ms 后重试" << std::endl;
+                
+                auto start = std::chrono::steady_clock::now();
+                while (true) {
+                    if (checkShutdown()) {
+                        throw std::runtime_error("Shutdown requested");
+                    }
+                    
+                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - start).count();
+                    
+                    if (elapsed >= delay_ms) {
+                        break;
+                    }
+                    
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
             }
         }
         throw std::runtime_error("Unexpected error in retry logic");
     }
     
     void worker() {
-        while (true) {
-            int idx = job_index.fetch_add(1);
-            if (idx >= jobs.size()) {
-                break;
+        try {
+            while (!checkShutdown()) {
+                int idx = job_index.fetch_add(1);
+                if (idx >= jobs.size()) {
+                    break;
+                }
+                
+                const Job& job = jobs[idx];
+                Result result;
+                result.key = job.key;
+                result.index = job.index;
+                
+                try {
+                    result.text = callAPI(job.text);
+                    saveToTempFile(job.key, result.text);
+                    
+                    int current_completed = completed_count.fetch_add(1) + 1;
+                    float percentage = static_cast<float>(current_completed) / jobs.size() * 100.0f;
+                    
+                    std::stringstream ss;
+                    ss << "\r进度: " << current_completed << "/" << jobs.size() 
+                       << " [" << std::fixed << std::setprecision(2) << percentage << "%] - 完成: " << job.key;
+                    std::cout << ss.str() << std::flush;
+                    
+                } catch (const std::exception& e) {
+                    if (g_shutdown_requested && std::string(e.what()) == "Shutdown requested") {
+                        result.error = "用户中断";
+                    } else {
+                        result.error = e.what();
+                    }
+                }
+                
+                {
+                    std::lock_guard<std::mutex> lock(results_mutex);
+                    results[result.index] = result;
+                }
             }
-            
-            const Job& job = jobs[idx];
-            Result result;
-            result.key = job.key;
-            result.index = job.index;
-            
-            try {
-                result.text = callAPI(job.text);
-                saveToTempFile(job.key, result.text);
-                
-                int current_completed = completed_count.fetch_add(1) + 1;
-                float percentage = static_cast<float>(current_completed) / jobs.size() * 100.0f;
-                
-                std::stringstream ss;
-                ss << "\r进度: " << current_completed << "/" << jobs.size() 
-                   << " [" << std::fixed << std::setprecision(2) << percentage << "%] - 完成: " << job.key;
-                std::cout << ss.str() << std::flush;
-                
-            } catch (const std::exception& e) {
-                result.error = e.what();
-            }
-            
-            std::lock_guard<std::mutex> lock(results_mutex);
-            results[result.index] = result;
+        } catch (const std::exception& e) {
+            std::cerr << "Worker线程异常: " << e.what() << std::endl;
+        } catch (...) {
+            std::cerr << "Worker线程未知异常" << std::endl;
         }
     }
     
@@ -367,19 +476,127 @@ public:
         
         for (auto& w : workers) {
             if (w.joinable()) {
+                auto start = std::chrono::steady_clock::now();
                 w.join();
+                auto end = std::chrono::steady_clock::now();
+                auto duration = std::chrono::duration_cast<std::chrono::seconds>(end - start);
+                if (duration.count() > 30) {
+                    std::cerr << "警告: Worker线程等待时间过长" << std::endl;
+                }
             }
         }
         std::cout << std::endl;
         
         std::vector<Result> sorted_results;
-        for (const auto& pair : results) {
-            sorted_results.push_back(pair.second);
+        {
+            std::lock_guard<std::mutex> lock(results_mutex);
+            for (const auto& pair : results) {
+                sorted_results.push_back(pair.second);
+            }
         }
         return sorted_results;
     }
 };
 
+void WorkerManager::saveToTempFile(const std::string& key, const std::string& text) {
+    {
+        std::lock_guard<std::mutex> lock(write_buffer->mutex);
+        write_buffer->data[key] = text;
+    }
+    
+    if (write_buffer->data.size() >= 10) {
+        swapBuffers();
+    }
+}
+
+void WorkerManager::swapBuffers() {
+    std::unique_lock<std::mutex> swap_lock(swap_mutex);
+    
+    {
+        std::lock_guard<std::mutex> lock1(write_buffer->mutex);
+        std::lock_guard<std::mutex> lock2(flush_buffer->mutex);
+        
+        Buffer* temp = write_buffer;
+        write_buffer = flush_buffer;
+        flush_buffer = temp;
+    }
+    
+    flush_cv.notify_one();
+}
+
+void WorkerManager::flushWorker() {
+    try {
+        while (running) {
+            std::unique_lock<std::mutex> lock(flush_mutex);
+            if (!flush_cv.wait_for(lock, std::chrono::seconds(5), [this] { 
+                return !flush_buffer->data.empty() || !running; 
+            })) {
+                continue;
+            }
+            
+            if (!running && flush_buffer->data.empty()) {
+                break;
+            }
+            
+            if (!flush_buffer->data.empty()) {
+                flushBufferData(flush_buffer);
+            }
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Flush线程异常: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "Flush线程未知异常" << std::endl;
+    }
+}
+
+void WorkerManager::flushBufferData(Buffer* buffer) {
+    std::map<std::string, std::string> to_write;
+    {
+        std::lock_guard<std::mutex> lock(buffer->mutex);
+        if (buffer->data.empty()) return;
+        to_write = std::move(buffer->data);
+        buffer->data.clear();
+    }
+    
+    std::string temp_file_path = temp_output_file + ".tmp";
+    std::ofstream temp_file(temp_file_path);
+    
+    if (!temp_file.is_open()) {
+        std::cerr << "警告: 无法创建临时文件 " << temp_file_path << std::endl;
+        return;
+    }
+    
+    std::map<std::string, std::string> existing_data;
+    try {
+        std::ifstream current_file(temp_output_file);
+        if (current_file.is_open()) {
+            current_file.close();
+            existing_data = readJsonFile(temp_output_file);
+        }
+    } catch (...) {
+    }
+    
+    for (const auto& pair : to_write) {
+        existing_data[pair.first] = pair.second;
+    }
+    
+    Json::Value root;
+    for (const auto& pair : existing_data) {
+        root[pair.first] = pair.second;
+    }
+    
+    Json::StreamWriterBuilder writer;
+    writer["emitUTF8"] = true;
+    writer["indentation"] = "  ";
+    std::unique_ptr<Json::StreamWriter> jsonWriter(writer.newStreamWriter());
+    jsonWriter->write(root, &temp_file);
+    temp_file.close();
+    
+    if (std::rename(temp_file_path.c_str(), temp_output_file.c_str()) != 0) {
+        std::cerr << "警告: 无法更新临时文件 " << temp_output_file << std::endl;
+        std::remove(temp_file_path.c_str());
+    }
+}
 
 std::map<std::string, std::string> readJsonFile(const std::string& filename) {
     std::ifstream file(filename);
@@ -421,25 +638,6 @@ void writeJsonFile(const std::string& filename, const std::map<std::string, std:
     jsonWriter->write(root, &file);
 }
 
-void WorkerManager::saveToTempFile(const std::string& key, const std::string& text) {
-    std::lock_guard<std::mutex> lock(temp_file_mutex);
-    
-    std::map<std::string, std::string> existing_data;
-    std::ifstream temp_file_in(temp_output_file);
-    if (temp_file_in.is_open()) {
-        temp_file_in.close();
-        try {
-            existing_data = readJsonFile(temp_output_file);
-        } catch (...) {
-            
-        }
-    }
-    
-    existing_data[key] = text;
-    writeJsonFile(temp_output_file, existing_data);
-}
-
-
 void print_usage(const char* prog_name) {
     std::cerr << "用法: " << prog_name << " [选项]\n\n"
               << "选项:\n"
@@ -451,6 +649,9 @@ void print_usage(const char* prog_name) {
 }
 
 int main(int argc, char* argv[]) {
+    std::signal(SIGINT, signal_handler);
+    std::signal(SIGTERM, signal_handler);
+    
     std::string input_file = "trans.json";
     std::string output_file = "trans_output.json";
     std::string config_file = "config.json";
@@ -523,8 +724,19 @@ int main(int argc, char* argv[]) {
         std::cout << "总任务: " << original_texts.size() << "，需要翻译: " << jobs.size() << "，已跳过: " << completed_translations.size() << std::endl;
         
         auto client = std::make_shared<HttpClient>(config);
-        WorkerManager manager(jobs, config, client, temp_output_file);
-        auto results = manager.run();
+        std::unique_ptr<WorkerManager> manager;
+        
+        try {
+            manager = std::make_unique<WorkerManager>(jobs, config, client, temp_output_file);
+        } catch (...) {
+            throw;
+        }
+        
+        auto results = manager->run();
+        
+        if (g_shutdown_requested) {
+            std::cout << "\n检测到中断信号，正在保存进度..." << std::endl;
+        }
         
         std::map<std::string, std::string> final_output = completed_translations;
         int fail_count = 0;
@@ -541,11 +753,20 @@ int main(int argc, char* argv[]) {
         writeJsonFile(output_file, final_output);
         std::remove(temp_output_file.c_str());
         
+        if (g_shutdown_requested) {
+            std::cout << "\n程序已中断，已保存当前进度到 " << output_file << std::endl;
+            std::cout << "成功: " << final_output.size() << ", 失败: " << fail_count << std::endl;
+            return 1;
+        }
+        
         std::cout << "\n全部翻译完成，结果已写入 " << output_file << std::endl;
         std::cout << "成功: " << final_output.size() << ", 失败: " << fail_count << std::endl;
         
     } catch (const std::exception& e) {
         std::cerr << "发生严重错误: " << e.what() << std::endl;
+        return 1;
+    } catch (...) {
+        std::cerr << "发生未知严重错误" << std::endl;
         return 1;
     }
     
