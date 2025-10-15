@@ -213,21 +213,48 @@ public:
     }
 };
 
-static std::atomic<bool> g_shutdown_requested(false);
-static std::atomic<bool> g_force_exit(false);
+class GlobalState {
+private:
+    static std::atomic<bool> shutdown_requested;
+    static std::atomic<bool> force_exit;
+    static std::atomic<int> signal_count;
+
+public:
+    static void init() {
+        shutdown_requested = false;
+        force_exit = false;
+        signal_count = 0;
+    }
+    
+    static bool isShutdownRequested() { return shutdown_requested; }
+    static bool isForceExit() { return force_exit; }
+    
+    static void handleSignal(int signal) {
+        int current_count = signal_count.fetch_add(1) + 1;
+        
+        if (current_count == 1) {
+            std::cout << "\n收到中断信号，正在优雅退出... (再次按下 Ctrl+C 强制退出)" << std::endl;
+            shutdown_requested = true;
+        } else if (current_count >= 2) {
+            std::cout << "\n强制退出..." << std::endl;
+            force_exit = true;
+            std::_Exit(1);
+        }
+    }
+    
+    static void checkExitConditions() {
+        if (force_exit) {
+            std::_Exit(1);
+        }
+    }
+};
+
+std::atomic<bool> GlobalState::shutdown_requested(false);
+std::atomic<bool> GlobalState::force_exit(false);
+std::atomic<int> GlobalState::signal_count(0);
 
 void signal_handler(int signal) {
-    static int signal_count = 0;
-    signal_count++;
-    
-    if (signal_count == 1) {
-        std::cout << "\n收到中断信号，正在优雅退出..." << std::endl;
-        g_shutdown_requested = true;
-    } else if (signal_count >= 2) {
-        std::cout << "\n强制退出..." << std::endl;
-        g_force_exit = true;
-        std::quick_exit(1);
-    }
+    GlobalState::handleSignal(signal);
 }
 
 class WorkerManager {
@@ -242,32 +269,15 @@ private:
     std::mutex results_mutex;
     std::map<int, Result> results;
     
-    struct Buffer {
-        std::map<std::string, std::string> data;
-        std::mutex mutex;
-        bool active;
-    };
-    
-    Buffer buffer1;
-    Buffer buffer2;
-    Buffer* write_buffer;
-    Buffer* flush_buffer;
-    std::thread flush_thread;
-    std::atomic<bool> running;
-    std::condition_variable flush_cv;
-    std::mutex flush_mutex;
-    const std::string& temp_output_file;
-    std::mutex swap_mutex;
+    std::mutex output_mutex;
+    const std::string& output_file;
     
     int max_retries;
     int base_delay_ms;
     int max_delay_ms;
     std::mt19937 rng;
     
-    void flushWorker();
-    void saveToTempFile(const std::string& key, const std::string& text);
-    void swapBuffers();
-    void flushBufferData(Buffer* buffer);
+    void saveToOutputFile(const std::string& key, const std::string& text);
     
     int calculateDelayWithJitter(int attempt) {
         int delay = base_delay_ms * (1 << (attempt - 1));
@@ -277,66 +287,23 @@ private:
     }
     
     bool checkShutdown() {
-        if (g_force_exit) {
-            std::quick_exit(1);
-        }
-        return g_shutdown_requested;
+        GlobalState::checkExitConditions();
+        return GlobalState::isShutdownRequested();
     }
     
 public:
-    WorkerManager(const std::vector<Job>& jobs_list, const Config& config, std::shared_ptr<HttpClient> http_client, const std::string& temp_file)
+    WorkerManager(const std::vector<Job>& jobs_list, const Config& config, std::shared_ptr<HttpClient> http_client, const std::string& out_file)
         : jobs(jobs_list), 
           concurrency(config.workers), 
           client(http_client), 
           model(config.model),
           job_index(0), 
           completed_count(0),
-          temp_output_file(temp_file),
+          output_file(out_file),
           max_retries(config.max_retries), 
           base_delay_ms(config.base_delay_ms), 
           max_delay_ms(config.max_delay_ms), 
-          rng(std::random_device{}()),
-          running(true) {
-        
-        buffer1.active = true;
-        buffer2.active = false;
-        write_buffer = &buffer1;
-        flush_buffer = &buffer2;
-        
-        flush_thread = std::thread(&WorkerManager::flushWorker, this);
-    }
-    
-    ~WorkerManager() {
-        running = false;
-        flush_cv.notify_all();
-        
-        if (flush_thread.joinable()) {
-            auto start = std::chrono::steady_clock::now();
-            if (flush_thread.joinable()) {
-                flush_thread.join();
-            }
-            auto end = std::chrono::steady_clock::now();
-            auto duration = std::chrono::duration_cast<std::chrono::seconds>(end - start);
-            if (duration.count() > 5) {
-                std::cerr << "警告: Flush线程等待时间过长" << std::endl;
-            }
-        }
-        
-        if (!write_buffer->data.empty()) {
-            try {
-                swapBuffers();
-                flushBufferData(flush_buffer);
-            } catch (...) {
-                std::cerr << "警告: 最终数据刷新失败" << std::endl;
-            }
-        }
-    }
-    
-    void requestShutdown() {
-        g_shutdown_requested = true;
-        running = false;
-        flush_cv.notify_all();
-    }
+          rng(std::random_device{}()) {}
     
     std::string callAPI(const std::string& text) {
         if (checkShutdown()) {
@@ -438,7 +405,7 @@ public:
                 
                 try {
                     result.text = callAPI(job.text);
-                    saveToTempFile(job.key, result.text);
+                    saveToOutputFile(job.key, result.text);
                     
                     int current_completed = completed_count.fetch_add(1) + 1;
                     float percentage = static_cast<float>(current_completed) / jobs.size() * 100.0f;
@@ -449,7 +416,7 @@ public:
                     std::cout << ss.str() << std::flush;
                     
                 } catch (const std::exception& e) {
-                    if (g_shutdown_requested && std::string(e.what()) == "Shutdown requested") {
+                    if (GlobalState::isShutdownRequested() && std::string(e.what()) == "Shutdown requested") {
                         result.error = "用户中断";
                     } else {
                         result.error = e.what();
@@ -476,13 +443,7 @@ public:
         
         for (auto& w : workers) {
             if (w.joinable()) {
-                auto start = std::chrono::steady_clock::now();
                 w.join();
-                auto end = std::chrono::steady_clock::now();
-                auto duration = std::chrono::duration_cast<std::chrono::seconds>(end - start);
-                if (duration.count() > 30) {
-                    std::cerr << "警告: Worker线程等待时间过长" << std::endl;
-                }
             }
         }
         std::cout << std::endl;
@@ -498,104 +459,37 @@ public:
     }
 };
 
-void WorkerManager::saveToTempFile(const std::string& key, const std::string& text) {
-    {
-        std::lock_guard<std::mutex> lock(write_buffer->mutex);
-        write_buffer->data[key] = text;
-    }
-    
-    if (write_buffer->data.size() >= 10) {
-        swapBuffers();
-    }
-}
-
-void WorkerManager::swapBuffers() {
-    std::unique_lock<std::mutex> swap_lock(swap_mutex);
-    
-    {
-        std::lock_guard<std::mutex> lock1(write_buffer->mutex);
-        std::lock_guard<std::mutex> lock2(flush_buffer->mutex);
-        
-        Buffer* temp = write_buffer;
-        write_buffer = flush_buffer;
-        flush_buffer = temp;
-    }
-    
-    flush_cv.notify_one();
-}
-
-void WorkerManager::flushWorker() {
-    try {
-        while (running) {
-            std::unique_lock<std::mutex> lock(flush_mutex);
-            if (!flush_cv.wait_for(lock, std::chrono::seconds(5), [this] { 
-                return !flush_buffer->data.empty() || !running; 
-            })) {
-                continue;
-            }
-            
-            if (!running && flush_buffer->data.empty()) {
-                break;
-            }
-            
-            if (!flush_buffer->data.empty()) {
-                flushBufferData(flush_buffer);
-            }
-        }
-    } catch (const std::exception& e) {
-        std::cerr << "Flush线程异常: " << e.what() << std::endl;
-    } catch (...) {
-        std::cerr << "Flush线程未知异常" << std::endl;
-    }
-}
-
-void WorkerManager::flushBufferData(Buffer* buffer) {
-    std::map<std::string, std::string> to_write;
-    {
-        std::lock_guard<std::mutex> lock(buffer->mutex);
-        if (buffer->data.empty()) return;
-        to_write = std::move(buffer->data);
-        buffer->data.clear();
-    }
-    
-    std::string temp_file_path = temp_output_file + ".tmp";
-    std::ofstream temp_file(temp_file_path);
-    
-    if (!temp_file.is_open()) {
-        std::cerr << "警告: 无法创建临时文件 " << temp_file_path << std::endl;
-        return;
-    }
+void WorkerManager::saveToOutputFile(const std::string& key, const std::string& text) {
+    std::lock_guard<std::mutex> lock(output_mutex);
     
     std::map<std::string, std::string> existing_data;
     try {
-        std::ifstream current_file(temp_output_file);
+        std::ifstream current_file(output_file);
         if (current_file.is_open()) {
             current_file.close();
-            existing_data = readJsonFile(temp_output_file);
+            existing_data = readJsonFile(output_file);
         }
     } catch (...) {
     }
     
-    for (const auto& pair : to_write) {
-        existing_data[pair.first] = pair.second;
-    }
+    existing_data[key] = text;
     
     Json::Value root;
     for (const auto& pair : existing_data) {
         root[pair.first] = pair.second;
     }
     
+    std::ofstream file(output_file);
+    if (!file.is_open()) {
+        std::cerr << "警告: 无法写入输出文件 " << output_file << std::endl;
+        return;
+    }
+    
     Json::StreamWriterBuilder writer;
     writer["emitUTF8"] = true;
     writer["indentation"] = "  ";
     std::unique_ptr<Json::StreamWriter> jsonWriter(writer.newStreamWriter());
-    jsonWriter->write(root, &temp_file);
-    temp_file.close();
-    
-    if (std::rename(temp_file_path.c_str(), temp_output_file.c_str()) != 0) {
-        std::cerr << "警告: 无法更新临时文件 " << temp_output_file << std::endl;
-        std::remove(temp_file_path.c_str());
-    }
+    jsonWriter->write(root, &file);
 }
 
 std::map<std::string, std::string> readJsonFile(const std::string& filename) {
@@ -649,13 +543,13 @@ void print_usage(const char* prog_name) {
 }
 
 int main(int argc, char* argv[]) {
+    GlobalState::init();
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
     
     std::string input_file = "trans.json";
     std::string output_file = "trans_output.json";
     std::string config_file = "config.json";
-    const std::string temp_output_file = "trans_output_temp.json";
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -690,16 +584,16 @@ int main(int argc, char* argv[]) {
         auto original_texts = readJsonFile(input_file);
         
         std::map<std::string, std::string> completed_translations;
-        std::ifstream temp_file_check(temp_output_file);
-        if (temp_file_check.is_open()) {
-            temp_file_check.close();
+        std::ifstream output_file_check(output_file);
+        if (output_file_check.is_open()) {
+            output_file_check.close();
             try {
-                completed_translations = readJsonFile(temp_output_file);
+                completed_translations = readJsonFile(output_file);
                 if (!completed_translations.empty()) {
-                    std::cout << "从临时文件恢复了 " << completed_translations.size() << " 条已完成的翻译。" << std::endl;
+                    std::cout << "从输出文件恢复了 " << completed_translations.size() << " 条已完成的翻译。" << std::endl;
                 }
             } catch (const std::exception& e) {
-                std::cout << "警告: 读取临时文件失败，将重新开始翻译: " << e.what() << std::endl;
+                std::cout << "警告: 读取输出文件失败，将重新开始翻译: " << e.what() << std::endl;
             }
         }
         
@@ -713,54 +607,22 @@ int main(int argc, char* argv[]) {
         
         if (jobs.empty()) {
             std::cout << "所有翻译任务均已完成。" << std::endl;
-            if (!completed_translations.empty()) {
-                writeJsonFile(output_file, completed_translations);
-                std::cout << "结果已写入 " << output_file << std::endl;
-                std::remove(temp_output_file.c_str());
-            }
             return 0;
         }
         
         std::cout << "总任务: " << original_texts.size() << "，需要翻译: " << jobs.size() << "，已跳过: " << completed_translations.size() << std::endl;
         
         auto client = std::make_shared<HttpClient>(config);
-        std::unique_ptr<WorkerManager> manager;
+        WorkerManager manager(jobs, config, client, output_file);
         
-        try {
-            manager = std::make_unique<WorkerManager>(jobs, config, client, temp_output_file);
-        } catch (...) {
-            throw;
-        }
+        auto results = manager.run();
         
-        auto results = manager->run();
-        
-        if (g_shutdown_requested) {
-            std::cout << "\n检测到中断信号，正在保存进度..." << std::endl;
-        }
-        
-        std::map<std::string, std::string> final_output = completed_translations;
-        int fail_count = 0;
-        
-        for (const auto& result : results) {
-            if (result.error.empty()) {
-                final_output[result.key] = result.text;
-            } else {
-                std::cerr << "\n错误: key='" << result.key << "' 翻译失败: " << result.error << std::endl;
-                fail_count++;
-            }
-        }
-        
-        writeJsonFile(output_file, final_output);
-        std::remove(temp_output_file.c_str());
-        
-        if (g_shutdown_requested) {
-            std::cout << "\n程序已中断，已保存当前进度到 " << output_file << std::endl;
-            std::cout << "成功: " << final_output.size() << ", 失败: " << fail_count << std::endl;
+        if (GlobalState::isShutdownRequested()) {
+            std::cout << "\n检测到中断信号，已保存当前进度到 " << output_file << std::endl;
             return 1;
         }
         
         std::cout << "\n全部翻译完成，结果已写入 " << output_file << std::endl;
-        std::cout << "成功: " << final_output.size() << ", 失败: " << fail_count << std::endl;
         
     } catch (const std::exception& e) {
         std::cerr << "发生严重错误: " << e.what() << std::endl;
