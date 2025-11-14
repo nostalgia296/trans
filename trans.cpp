@@ -14,6 +14,7 @@
 #include <string>
 #include <condition_variable>
 #include <csignal>
+#include <queue>
 
 #include <curl/curl.h>
 #include <json/json.h>
@@ -177,38 +178,68 @@ private:
     std::string base_url;
     std::string api_key;
     long timeout_seconds;
-    
+    CURL* curl;
+    struct curl_slist* headers;
+
+    HttpClient(const HttpClient&) = delete;
+    HttpClient& operator=(const HttpClient&) = delete;
+
 public:
-    HttpClient(const Config& config) 
-        : base_url(config.base_url), api_key(config.api_key), timeout_seconds(config.timeout_seconds) {}
-    
-    std::string post(const std::string& payload) {
-        CURL* curl = curl_easy_init();
+    HttpClient(const Config& config)
+        : base_url(config.base_url),
+          api_key(config.api_key),
+          timeout_seconds(config.timeout_seconds),
+          curl(nullptr),
+          headers(nullptr) {
+
+        curl = curl_easy_init();
         if (!curl) {
             throw std::runtime_error("Failed to initialize CURL handle");
         }
-        
-        std::string response;
-        struct curl_slist* headers = nullptr;
+
         headers = curl_slist_append(headers, "Content-Type: application/json");
         headers = curl_slist_append(headers, ("Authorization: Bearer " + api_key).c_str());
-        
+
         curl_easy_setopt(curl, CURLOPT_URL, base_url.c_str());
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload.c_str());
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
         curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_seconds);
-        
+
+#ifdef CURLPIPE_MULTIPLEX
+        curl_easy_setopt(curl, CURLOPT_PIPEWAIT, 1L);
+        curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2);
+#endif
+    }
+
+    ~HttpClient() {
+        if (headers) {
+            curl_slist_free_all(headers);
+        }
+        if (curl) {
+            curl_easy_cleanup(curl);
+        }
+    }
+
+    std::string post(const std::string& payload) {
+        std::string response;
+
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload.c_str());
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+
         CURLcode res = curl_easy_perform(curl);
-        
-        curl_slist_free_all(headers);
-        curl_easy_cleanup(curl);
-        
+
         if (res != CURLE_OK) {
             throw std::runtime_error("CURL request failed: " + std::string(curl_easy_strerror(res)));
         }
-        
+
+        long response_code = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+        if (response_code >= 400) {
+            throw std::runtime_error("HTTP error: " + std::to_string(response_code));
+        }
+
         return response;
     }
 };
@@ -231,7 +262,7 @@ public:
     
     static void handleSignal(int signal) {
         int current_count = signal_count.fetch_add(1) + 1;
-        
+
         if (current_count == 1) {
             std::cout << "\n收到中断信号，正在优雅退出... (再次按下 Ctrl+C 强制退出)" << std::endl;
             shutdown_requested = true;
@@ -263,21 +294,27 @@ private:
     int concurrency;
     std::shared_ptr<HttpClient> client;
     std::string model;
-    
+
     std::atomic<int> job_index;
     std::atomic<int> completed_count;
     std::mutex results_mutex;
     std::map<int, Result> results;
-    
+
     std::mutex output_mutex;
+    std::condition_variable output_cv;
     const std::string& output_file;
-    
+    std::map<std::string, std::string> unsaved_translations;
+    int pending_writes;
+    bool auto_save_running;
+
     int max_retries;
     int base_delay_ms;
     int max_delay_ms;
     std::mt19937 rng;
-    
+
     void saveToOutputFile(const std::string& key, const std::string& text);
+    void flushPendingWrites();
+    void autoSaveLoop();
     
     int calculateDelayWithJitter(int attempt) {
         int delay = base_delay_ms * (1 << (attempt - 1));
@@ -293,17 +330,19 @@ private:
     
 public:
     WorkerManager(const std::vector<Job>& jobs_list, const Config& config, std::shared_ptr<HttpClient> http_client, const std::string& out_file)
-        : jobs(jobs_list), 
-          concurrency(config.workers), 
-          client(http_client), 
+        : jobs(jobs_list),
+          concurrency(config.workers),
+          client(http_client),
           model(config.model),
-          job_index(0), 
+          job_index(0),
           completed_count(0),
           output_file(out_file),
-          max_retries(config.max_retries), 
-          base_delay_ms(config.base_delay_ms), 
-          max_delay_ms(config.max_delay_ms), 
-          rng(std::random_device{}()) {}
+          max_retries(config.max_retries),
+          base_delay_ms(config.base_delay_ms),
+          max_delay_ms(config.max_delay_ms),
+          rng(std::random_device{}()),
+          pending_writes(0),
+          auto_save_running(true) {}
     
     std::string callAPI(const std::string& text) {
         if (checkShutdown()) {
@@ -392,29 +431,32 @@ public:
     
     void worker() {
         try {
+            int tasks_since_check = 0;
+            const int SHUTDOWN_CHECK_INTERVAL = 10;
+
             while (!checkShutdown()) {
                 int idx = job_index.fetch_add(1);
                 if (idx >= jobs.size()) {
                     break;
                 }
-                
+
                 const Job& job = jobs[idx];
                 Result result;
                 result.key = job.key;
                 result.index = job.index;
-                
+
                 try {
                     result.text = callAPI(job.text);
                     saveToOutputFile(job.key, result.text);
-                    
+
                     int current_completed = completed_count.fetch_add(1) + 1;
                     float percentage = static_cast<float>(current_completed) / jobs.size() * 100.0f;
-                    
+
                     std::stringstream ss;
-                    ss << "\r进度: " << current_completed << "/" << jobs.size() 
+                    ss << "\r进度: " << current_completed << "/" << jobs.size()
                        << " [" << std::fixed << std::setprecision(2) << percentage << "%] - 完成: " << job.key;
                     std::cout << ss.str() << std::flush;
-                    
+
                 } catch (const std::exception& e) {
                     if (GlobalState::isShutdownRequested() && std::string(e.what()) == "Shutdown requested") {
                         result.error = "用户中断";
@@ -422,10 +464,18 @@ public:
                         result.error = e.what();
                     }
                 }
-                
+
                 {
                     std::lock_guard<std::mutex> lock(results_mutex);
                     results[result.index] = result;
+                }
+
+                tasks_since_check++;
+                if (tasks_since_check >= SHUTDOWN_CHECK_INTERVAL) {
+                    tasks_since_check = 0;
+                    if (checkShutdown()) {
+                        break;
+                    }
                 }
             }
         } catch (const std::exception& e) {
@@ -440,14 +490,24 @@ public:
         for (int i = 0; i < std::min(concurrency, (int)jobs.size()); ++i) {
             workers.emplace_back(&WorkerManager::worker, this);
         }
-        
+
+        std::thread auto_save_thread(&WorkerManager::autoSaveLoop, this);
+
         for (auto& w : workers) {
             if (w.joinable()) {
                 w.join();
             }
         }
+
+        auto_save_running = false;
+        output_cv.notify_all();
+        if (auto_save_thread.joinable()) {
+            auto_save_thread.join();
+        }
+
+        flushPendingWrites();
         std::cout << std::endl;
-        
+
         std::vector<Result> sorted_results;
         {
             std::lock_guard<std::mutex> lock(results_mutex);
@@ -461,7 +521,43 @@ public:
 
 void WorkerManager::saveToOutputFile(const std::string& key, const std::string& text) {
     std::lock_guard<std::mutex> lock(output_mutex);
-    
+
+    unsaved_translations[key] = text;
+    pending_writes++;
+
+    if (pending_writes > 0) {
+        output_cv.notify_one();
+    }
+
+    const int BATCH_SIZE = 50;
+    if (pending_writes >= BATCH_SIZE) {
+        flushPendingWrites();
+    }
+}
+
+void WorkerManager::autoSaveLoop() {
+    while (auto_save_running) {
+        std::unique_lock<std::mutex> lock(output_mutex);
+
+        output_cv.wait_for(lock, std::chrono::seconds(30), [this] {
+            return !auto_save_running || pending_writes > 0;
+        });
+
+        if (!auto_save_running) {
+            break;
+        }
+
+        if (pending_writes > 0) {
+            flushPendingWrites();
+        }
+    }
+}
+
+void WorkerManager::flushPendingWrites() {
+    if (pending_writes == 0) {
+        return;
+    }
+
     std::map<std::string, std::string> existing_data;
     try {
         std::ifstream current_file(output_file);
@@ -471,25 +567,33 @@ void WorkerManager::saveToOutputFile(const std::string& key, const std::string& 
         }
     } catch (...) {
     }
-    
-    existing_data[key] = text;
-    
+
+    for (const auto& pair : unsaved_translations) {
+        existing_data[pair.first] = pair.second;
+    }
+    unsaved_translations.clear();
+    pending_writes = 0;
+
     Json::Value root;
     for (const auto& pair : existing_data) {
         root[pair.first] = pair.second;
     }
-    
+
     std::ofstream file(output_file);
     if (!file.is_open()) {
         std::cerr << "警告: 无法写入输出文件 " << output_file << std::endl;
         return;
     }
-    
+
     Json::StreamWriterBuilder writer;
     writer["emitUTF8"] = true;
     writer["indentation"] = "  ";
     std::unique_ptr<Json::StreamWriter> jsonWriter(writer.newStreamWriter());
     jsonWriter->write(root, &file);
+
+    if (!file.good()) {
+        std::cerr << "警告: 写入输出文件时可能出现问题" << std::endl;
+    }
 }
 
 std::map<std::string, std::string> readJsonFile(const std::string& filename) {
